@@ -4,6 +4,7 @@ This module holds various MT evaluation metrics.
 """
 
 import sacrebleu
+from typing import List
 
 
 def chrf(hypotheses, references):
@@ -27,6 +28,13 @@ def bleu(hypotheses, references):
     """
     return sacrebleu.raw_corpus_bleu(sys_stream=hypotheses,
                                      ref_streams=[references]).score
+
+def sent_bleu(hypotheses, references)-> List[float]:
+    scores = []
+    for h, r in zip(hypotheses, references):
+        scores.append(sacrebleu.sentence_bleu(hypothesis = h, references = r).score)
+    return scores
+
 
 
 def token_accuracy(hypotheses, references, level="word"):

@@ -4,7 +4,7 @@ Module to represents whole models
 """
 
 import numpy as np
-
+import torch
 import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
@@ -14,10 +14,13 @@ from joeynmt.embeddings import Embeddings
 from joeynmt.encoders import Encoder, RecurrentEncoder, TransformerEncoder
 from joeynmt.decoders import Decoder, RecurrentDecoder, TransformerDecoder
 from joeynmt.constants import PAD_TOKEN, EOS_TOKEN, BOS_TOKEN
-from joeynmt.search import beam_search, greedy
+from joeynmt.search import beam_search, greedy, sample_rl_transformer
 from joeynmt.vocabulary import Vocabulary
 from joeynmt.batch import Batch
-from joeynmt.helpers import ConfigurationError
+from joeynmt.helpers import ConfigurationError, bpe_postprocess
+
+from joeynmt.metrics import sent_bleu
+
 
 
 class Model(nn.Module):
@@ -139,6 +142,127 @@ class Model(nn.Module):
         batch_loss = loss_function(log_probs, batch.trg)
         # return batch loss = sum over all elements in batch that are not pad
         return batch_loss
+    
+    def run_rl_batch(self, batch: Batch, max_output_length: int) -> (np.array, np.array):
+        """
+        Get outputs and attentions scores for a given batch
+
+        :param batch: batch to generate hypotheses for
+        :param max_output_length: maximum length of hypotheses
+        :param beam_size: size of the beam for beam search, if 0 use greedy
+        :param beam_alpha: alpha value for beam search
+        :return: stacked_output: hypotheses for batch,
+            stacked_attention_scores: attention scores for batch
+        """
+        encoder_output, encoder_hidden = self.encode(
+            batch.src, batch.src_lengths,
+            batch.src_mask)
+
+        # if maximum output length is not globally specified, adapt to src len
+        if max_output_length is None:
+            max_output_length = int(max(batch.src_lengths.cpu().numpy()) * 1.5)
+
+        # greedy decoding
+        stacked_output, transposed_log_probs = sample_rl_transformer(
+                encoder_hidden=encoder_hidden,
+                encoder_output=encoder_output, eos_index=self.eos_index,
+                src_mask=batch.src_mask, embed=self.trg_embed,
+                bos_index=self.bos_index, decoder=self.decoder,
+                max_output_length=max_output_length)
+            # batch, time, max_src_length
+
+        return stacked_output, transposed_log_probs
+
+    def get_rl_loss_for_batch(model: Model, batch: Batch, use_cuda: bool, max_output_length: int,
+                         level: str, batch_type: str = "sentence") -> Tensor:
+        """
+        Generate translations for the given data.
+        If `loss_function` is not None and references are given,
+        also compute the loss.
+
+        :param model: model module
+        :param logger: logger
+        :param data: dataset for validation
+        :param batch_size: validation batch size
+        :param use_cuda: if True, use CUDA
+        :param max_output_length: maximum length for generated hypotheses
+        :param level: segmentation level, one of "char", "bpe", "word"
+        :param eval_metric: evaluation metric, e.g. "bleu"
+        :param loss_function: loss function that computes a scalar loss
+            for given inputs and targets
+        :param beam_size: beam size for validation.
+            If <2 then greedy decoding (default).
+        :param beam_alpha: beam search alpha for length penalty,
+            disabled if set to -1 (default).
+        :param batch_type: validation batch type (sentence or token)
+
+        :return:
+            - current_valid_score: current validation score [eval_metric],
+            - valid_loss: validation loss,
+            - valid_ppl:, validation perplexity,
+            - valid_sources: validation sources,
+            - valid_sources_raw: raw validation sources (before post-processing),
+            - valid_references: validation references,
+            - valid_hypotheses: validation_hypotheses,
+            - decoded_valid: raw validation hypotheses (before post-processing),
+            - valid_attention_scores: attention scores for validation hypotheses
+        """
+
+        # sort batch now by src length and keep track of order
+        sort_reverse_index = batch.sort_by_src_lengths()
+
+        # run as during inference to produce translations & RL score
+        output, transposed_log_probs = model.run_rl_batch(
+            batch=batch, max_output_length=max_output_length)
+
+        # sort outputs back to original order
+        output = output[sort_reverse_index]
+        log_probs = torch.stack(transposed_log_probs[sort_reverse_index]).T # T x B -> B x T as Tensor
+
+        # decode back to symbols
+        decoded_valid = model.trg_vocab.arrays_to_sentences(arrays=output,
+                                                            cut_at_eos=True)
+
+        # evaluate with metric on full dataset
+        join_char = " " if level in ["word", "bpe"] else ""
+        valid_sources = [join_char.join(s) for s in batch.src]
+        valid_references = [join_char.join(t) for t in batch.trg]
+        valid_hypotheses = [join_char.join(t) for t in decoded_valid]
+
+        # post-process
+        if level == "bpe":
+            valid_sources = [bpe_postprocess(s) for s in valid_sources]
+            valid_references = [bpe_postprocess(v)
+                                for v in valid_references]
+            valid_hypotheses = [bpe_postprocess(v) for
+                                v in valid_hypotheses]
+
+        # if references are given, evaluate against them
+
+        assert len(valid_hypotheses) == len(valid_references)
+        reinforce_scores = sent_bleu(valid_hypotheses, valid_references) # len B List[float]
+        reinforce_scores = torch.tensor(reinforce_scores).unsqueeze(-1)
+        if use_cuda:
+            reinforce_scores = reinforce_scores.cuda()
+            log_probs = log_probs.cuda()
+        reward_adjusted_log_probs = torch.mul(log_probs, reinforce_scores)
+
+        batch_rl_loss = reward_adjusted_log_probs.sum()
+
+        return batch_rl_loss
+
+    def __repr__(self) -> str:
+        """
+        String representation: a description of encoder, decoder and embeddings
+
+        :return: string representation
+        """
+        return "%s(\n" \
+               "\tencoder=%s,\n" \
+               "\tdecoder=%s,\n" \
+               "\tsrc_embed=%s,\n" \
+               "\ttrg_embed=%s)" % (self.__class__.__name__, self.encoder,
+                   self.decoder, self.src_embed, self.trg_embed)
 
     def run_batch(self, batch: Batch, max_output_length: int, beam_size: int,
                   beam_alpha: float) -> (np.array, np.array):

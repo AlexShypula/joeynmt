@@ -7,6 +7,7 @@ import numpy as np
 from joeynmt.decoders import Decoder, TransformerDecoder
 from joeynmt.embeddings import Embeddings
 from joeynmt.helpers import tile
+from torch.distributions.categorical import Categorical
 
 
 __all__ = ["greedy", "transformer_greedy", "beam_search"]
@@ -168,6 +169,78 @@ def transformer_greedy(
 
     ys = ys[:, 1:]  # remove BOS-symbol
     return ys.detach().cpu().numpy(), None
+
+
+# pylint: disable=unused-argument
+def sample_rl_transformer(
+        src_mask: Tensor, embed: Embeddings,
+        bos_index: int, eos_index: int,
+        max_output_length: int, decoder: Decoder,
+        encoder_output: Tensor, encoder_hidden: Tensor) -> (np.array, None):
+    """
+    Special greedy function for transformer, since it works differently.
+    The transformer remembers all previous states and attends to them.
+
+    :param src_mask: mask for source inputs, 0 for positions after </s>
+    :param embed: target embedding layer
+    :param bos_index: index of <s> in the vocabulary
+    :param eos_index: index of </s> in the vocabulary
+    :param max_output_length: maximum length for the hypotheses
+    :param decoder: decoder to use for greedy decoding
+    :param encoder_output: encoder hidden states for attention
+    :param encoder_hidden: encoder final state (unused in Transformer)
+    :return:
+        - stacked_output: output hypotheses (2d array of indices),
+        - stacked_attention_scores: attention scores (3d array)
+    """
+
+    batch_size = src_mask.size(0)
+
+    # start with BOS-symbol for each sentence in the batch
+    ys = encoder_output.new_full([batch_size, 1], bos_index, dtype=torch.long)
+
+    # a subsequent mask is intersected with this in decoder forward pass
+    trg_mask = src_mask.new_ones([1, 1, 1])
+
+    finished = src_mask.new_zeros((batch_size)).byte()
+
+    log_probs_saved = []
+
+    for _ in range(max_output_length):
+
+        trg_embed = embed(ys)  # embed the previous tokens
+
+        # pylint: disable=unused-variable
+        with torch.no_grad():
+            logits, out, _, _ = decoder(
+                trg_embed=trg_embed,
+                encoder_output=encoder_output,
+                encoder_hidden=None,
+                src_mask=src_mask,
+                unroll_steps=None,
+                hidden=None,
+                trg_mask=trg_mask
+            )
+
+            logits = logits[:, -1]
+            probs = F.softmax(logits)
+            m = Categorical(probs)
+            next_word = m.sample()
+            log_probs = m.log_prob(next_word)
+            log_probs_saved.append(log_probs)
+
+            next_word = next_word.data
+            ys = torch.cat([ys, next_word.unsqueeze(-1)], dim=1)
+
+        # check if previous symbol was <eos>
+        is_eos = torch.eq(next_word, eos_index)
+        finished += is_eos
+        # stop predicting if <eos> reached for all elements in batch
+        if (finished >= 1).sum() == batch_size:
+            break
+
+    ys = ys[:, 1:]  # remove BOS-symbol
+    return ys.detach().cpu().numpy(), log_probs_saved
 
 
 # pylint: disable=too-many-statements,too-many-branches

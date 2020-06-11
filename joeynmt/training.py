@@ -462,7 +462,7 @@ class TrainManager:
         self.tb_writer.close()  # close Tensorboard writer
 
     def _train_batch(self, batch: Batch, update: bool = True,
-                     count: int = 1) -> Tensor:
+                     count: int = 1, mode = "RL") -> Tensor:
         """
         Train the model on one batch: Compute the loss, make a gradient step.
 
@@ -471,8 +471,11 @@ class TrainManager:
         :param count: number of portions (batch_size) left before update
         :return: loss for batch (sum)
         """
-        batch_loss = self.model.get_loss_for_batch(
-            batch=batch, loss_function=self.loss)
+        if mode == "RL":
+            batch_loss = self.model.run_rl_batch(batch, self.max_output_length)
+        else:     
+            batch_loss = self.model.get_loss_for_batch(
+                batch=batch, loss_function=self.loss)
 
         # normalize batch loss
         if self.normalization == "batch":
