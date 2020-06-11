@@ -174,7 +174,7 @@ class Model(nn.Module):
         return stacked_output, transposed_log_probs
 
     def get_rl_loss_for_batch(self, batch: Batch, use_cuda: bool, max_output_length: int,
-                         level: str, batch_type: str = "sentence") -> Tensor:
+                         level: str) -> Tensor:
         """
         Generate translations for the given data.
         If `loss_function` is not None and references are given,

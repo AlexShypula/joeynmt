@@ -472,7 +472,9 @@ class TrainManager:
         :return: loss for batch (sum)
         """
         if mode == "RL":
-            batch_loss = self.model.run_rl_batch(batch, self.max_output_length)
+            batch_loss = self.model.get_rl_loss_for_batch(batch = batch, use_cuda=self.use_cuda, 
+                                                          max_output_length =  self.max_output_length, 
+                                                          level = self.level)
         else:     
             batch_loss = self.model.get_loss_for_batch(
                 batch=batch, loss_function=self.loss)
