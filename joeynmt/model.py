@@ -173,7 +173,7 @@ class Model(nn.Module):
 
         return stacked_output, transposed_log_probs
 
-    def get_rl_loss_for_batch(model: Model, batch: Batch, use_cuda: bool, max_output_length: int,
+    def get_rl_loss_for_batch(self, batch: Batch, use_cuda: bool, max_output_length: int,
                          level: str, batch_type: str = "sentence") -> Tensor:
         """
         Generate translations for the given data.
@@ -212,7 +212,7 @@ class Model(nn.Module):
         sort_reverse_index = batch.sort_by_src_lengths()
 
         # run as during inference to produce translations & RL score
-        output, transposed_log_probs = model.run_rl_batch(
+        output, transposed_log_probs = self.run_rl_batch(
             batch=batch, max_output_length=max_output_length)
 
         # sort outputs back to original order
@@ -220,7 +220,7 @@ class Model(nn.Module):
         log_probs = torch.stack(transposed_log_probs[sort_reverse_index]).T # T x B -> B x T as Tensor
 
         # decode back to symbols
-        decoded_valid = model.trg_vocab.arrays_to_sentences(arrays=output,
+        decoded_valid = self.trg_vocab.arrays_to_sentences(arrays=output,
                                                             cut_at_eos=True)
 
         # evaluate with metric on full dataset
