@@ -32,7 +32,11 @@ def bleu(hypotheses, references):
 def sent_bleu(hypotheses, references)-> List[float]:
     scores = []
     for h, r in zip(hypotheses, references):
-        scores.append(sacrebleu.sentence_bleu(hypothesis = h, references = r).score)
+        scores.append(
+                sacrebleu.sentence_bleu(hypothesis = h, 
+                    references = r,
+                    smooth_method = "add-k", 
+                    smooth_value = 1).score)
     return scores
 
 

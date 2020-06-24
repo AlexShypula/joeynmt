@@ -32,7 +32,7 @@ from joeynmt.data import load_data, make_data_iter
 from joeynmt.builders import build_optimizer, build_scheduler, \
     build_gradient_clipper
 from joeynmt.prediction import test
-
+import gc
 
 # pylint: disable=too-many-instance-attributes
 class TrainManager:
@@ -300,6 +300,8 @@ class TrainManager:
             self.current_batch_multiplier = self.batch_multiplier
             count = self.current_batch_multiplier - 1
             epoch_loss = 0
+            multi_batch_loss = 0
+            multi_batch_bleu = 0
 
             for i, batch in enumerate(iter(train_iter)):
                 # reactivate training
@@ -314,28 +316,47 @@ class TrainManager:
 
                 # Set current_batch_mutliplier to fit
                 # number of leftover examples for last batch in epoch
-                if self.batch_multiplier > 1 and i == len(train_iter) - \
-                        math.ceil(leftover_batch_size / self.batch_size):
-                    self.current_batch_multiplier = math.ceil(
-                        leftover_batch_size / self.batch_size)
-                    count = self.current_batch_multiplier - 1
+                #if self.batch_multiplier > 1 and i == len(train_iter) - \
+                #        math.ceil(leftover_batch_size / self.batch_size):
+                #    self.current_batch_multiplier = math.ceil(
+                #        leftover_batch_size / self.batch_size)
+                #    count = self.current_batch_multiplier - 1
 
                 update = count == 0
                 # print(count, update, self.steps)
-                batch_loss = self._train_batch(
+                batch_loss, batch_bleu = self._train_batch(
                     batch, update=update, count=count)
+               
 
+                multi_batch_loss += batch_loss
+                multi_batch_bleu += batch_bleu
+                #torch.cuda.empty_cache()
+
+                del batch_loss
                 # Only save finaly computed batch_loss of full batch
                 if update:
+                    #breakpoint()
                     self.tb_writer.add_scalar("train/train_batch_loss",
-                                              batch_loss, self.steps)
+                                              multi_batch_loss, self.steps)
+                    self.tb_writer.add_scalar("train/train_batch_avg_bleu", 
+                            multi_batch_bleu, self.steps)
+                    self.tb_writer.add_scalar("train/baseline", 
+                                                self.model.baseline, self.steps)
+                    epoch_loss+=multi_batch_loss
+                    del multi_batch_loss
+                    del multi_batch_bleu
+                    gc.collect()
+
+                    multi_batch_loss = 0
+                    multi_batch_bleu = 0
+                                                
 
                 count = self.batch_multiplier if update else count
                 count -= 1
 
                 # Only add complete batch_loss of full mini-batch to epoch_loss
-                if update:
-                    epoch_loss += batch_loss.detach().cpu().numpy()
+                #if update:
+                #    epoch_loss += batch_loss.detach().cpu().numpy()
 
                 if self.scheduler is not None and \
                         self.scheduler_step_at == "step" and update:
@@ -348,7 +369,7 @@ class TrainManager:
                     self.logger.info(
                         "Epoch %3d Step: %8d Batch Loss: %12.6f "
                         "Tokens per Sec: %8.0f, Lr: %.6f",
-                        epoch_no + 1, self.steps, batch_loss,
+                        epoch_no + 1, self.steps, multi_batch_loss,
                         elapsed_tokens / elapsed,
                         self.optimizer.param_groups[0]["lr"])
                     start = time.time()
@@ -471,8 +492,9 @@ class TrainManager:
         :param count: number of portions (batch_size) left before update
         :return: loss for batch (sum)
         """
+        #breakpoint()
         if mode == "RL":
-            batch_loss = self.model.get_rl_loss_for_batch(batch = batch, use_cuda=self.use_cuda, 
+            batch_loss, batch_bleu = self.model.get_rl_loss_for_batch(batch = batch, loss_function = self.loss, use_cuda=self.use_cuda, 
                                                           max_output_length =  self.max_output_length, 
                                                           level = self.level)
         else:     
@@ -492,17 +514,26 @@ class TrainManager:
                 "or summation of loss 'none' implemented")
 
         norm_batch_loss = batch_loss / normalizer
+        if self.current_batch_multiplier > 1: 
+            norm_batch_loss = norm_batch_loss/self.current_batch_multiplier \
+                    if self.normalization != "none" else norm_batch_loss
+            norm_batch_bleu = batch_bleu / self.current_batch_multiplier \
+                    if self.normalization != "none" else batch_bleu
+
+
+        norm_batch_loss.backward()
+        #torch.cuda.empty_cache()
 
         if update:
-            if self.current_batch_multiplier > 1:
-                norm_batch_loss = self.norm_batch_loss_accumulated + \
-                    norm_batch_loss
-                norm_batch_loss = norm_batch_loss / \
-                    self.current_batch_multiplier if \
-                    self.normalization != "none" else \
-                    norm_batch_loss
+            #if self.current_batch_multiplier > 1:
+            #    norm_batch_loss = self.norm_batch_loss_accumulated + \
+            #        norm_batch_loss
+            #    norm_batch_loss = norm_batch_loss / \
+            #        self.current_batch_multiplier if \
+            #        self.normalization != "none" else \
+            #        norm_batch_loss
 
-            norm_batch_loss.backward()
+            #norm_batch_loss.backward()
 
             if self.clip_grad_fun is not None:
                 # clip gradients (in-place)
@@ -515,16 +546,16 @@ class TrainManager:
             # increment step counter
             self.steps += 1
 
-        else:
-            if count == self.current_batch_multiplier - 1:
-                self.norm_batch_loss_accumulated = norm_batch_loss
-            else:
-                # accumulate loss of current batch_size * batch_multiplier loss
-                self.norm_batch_loss_accumulated += norm_batch_loss
+        #else:
+        #    if count == self.current_batch_multiplier - 1:
+        #        self.norm_batch_loss_accumulated = norm_batch_loss
+        #    else:
+        #        # accumulate loss of current batch_size * batch_multiplier loss
+        #        self.norm_batch_loss_accumulated += norm_batch_loss
         # increment token counter
         self.total_tokens += batch.ntokens
 
-        return norm_batch_loss
+        return norm_batch_loss.detach(), norm_batch_bleu
 
     def _add_report(self, valid_score: float, valid_ppl: float,
                     valid_loss: float, eval_metric: str,

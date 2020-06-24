@@ -46,7 +46,7 @@ class Model(nn.Module):
         :param trg_vocab: target vocabulary
         """
         super(Model, self).__init__()
-
+        self.baseline = 18.2
         self.src_embed = src_embed
         self.trg_embed = trg_embed
         self.encoder = encoder
@@ -173,7 +173,7 @@ class Model(nn.Module):
 
         return stacked_output, transposed_log_probs
 
-    def get_rl_loss_for_batch(self, batch: Batch, use_cuda: bool, max_output_length: int,
+    def get_rl_loss_for_batch(self, batch: Batch, loss_function, use_cuda: bool, max_output_length: int,
                          level: str) -> Tensor:
         """
         Generate translations for the given data.
@@ -217,16 +217,23 @@ class Model(nn.Module):
 
         # sort outputs back to original order
         output = output[sort_reverse_index]
-        log_probs = torch.stack(transposed_log_probs[sort_reverse_index]).T # T x B -> B x T as Tensor
+        log_probs = torch.stack(transposed_log_probs).T[sort_reverse_index]# T x B -> B x T as Tensor
 
         # decode back to symbols
+        
+        
+        decoded_src = self.src_vocab.arrays_to_sentences(arrays=batch.src, 
+                                                            cut_at_eos=True)
+        decoded_trg = self.trg_vocab.arrays_to_sentences(arrays=batch.trg, 
+                                                            cut_at_eos=True)
         decoded_valid = self.trg_vocab.arrays_to_sentences(arrays=output,
                                                             cut_at_eos=True)
 
+
         # evaluate with metric on full dataset
         join_char = " " if level in ["word", "bpe"] else ""
-        valid_sources = [join_char.join(s) for s in batch.src]
-        valid_references = [join_char.join(t) for t in batch.trg]
+        valid_sources = [join_char.join(s) for s in decoded_src]
+        valid_references = [join_char.join(t) for t in decoded_trg]
         valid_hypotheses = [join_char.join(t) for t in decoded_valid]
 
         # post-process
@@ -240,16 +247,37 @@ class Model(nn.Module):
         # if references are given, evaluate against them
 
         assert len(valid_hypotheses) == len(valid_references)
+        #if self.counter == 20: 
+
+        #for h, r in zip(valid_hypotheses, valid_references): 
+        #    print(f"hypothesis is: {h}")
+        #    print("-"*40)
+        #    print(f"reference is {r}")
+        #    self.counter = 0
+        #else: 
+            #self.counter += 1
         reinforce_scores = sent_bleu(valid_hypotheses, valid_references) # len B List[float]
-        reinforce_scores = torch.tensor(reinforce_scores).unsqueeze(-1)
+        reinforce_scores = torch.tensor(reinforce_scores).unsqueeze(-1) 
+        mean_score = reinforce_scores.mean().item()
+        adjusted_scores = -1*(reinforce_scores - self.baseline)
         if use_cuda:
-            reinforce_scores = reinforce_scores.cuda()
+            adjusted_scores = adjusted_scores.cuda()
             log_probs = log_probs.cuda()
-        reward_adjusted_log_probs = torch.mul(log_probs, reinforce_scores)
+        reward_adjusted_log_probs = torch.mul(log_probs, adjusted_scores)
+        
+        self.baseline*=0.7
+        self.baseline+=0.3*mean_score
 
         batch_rl_loss = reward_adjusted_log_probs.sum()
+        #print(f"batch loss is {batch_rl_loss}")
 
-        return batch_rl_loss
+        mle_loss = self.get_loss_for_batch(batch, loss_function)
+        loss = 0.3*mle_loss + 0.7*batch_rl_loss
+        
+        del mle_loss
+        del batch_rl_loss
+        
+        return loss, mean_score
 
     def __repr__(self) -> str:
         """

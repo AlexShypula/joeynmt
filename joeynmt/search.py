@@ -211,26 +211,26 @@ def sample_rl_transformer(
         trg_embed = embed(ys)  # embed the previous tokens
 
         # pylint: disable=unused-variable
-        with torch.no_grad():
-            logits, out, _, _ = decoder(
-                trg_embed=trg_embed,
-                encoder_output=encoder_output,
-                encoder_hidden=None,
-                src_mask=src_mask,
-                unroll_steps=None,
-                hidden=None,
-                trg_mask=trg_mask
-            )
+        #with torch.no_grad():
+        logits, out, _, _ = decoder(
+            trg_embed=trg_embed,
+            encoder_output=encoder_output,
+            encoder_hidden=None,
+            src_mask=src_mask,
+            unroll_steps=None,
+            hidden=None,
+            trg_mask=trg_mask
+        )
 
-            logits = logits[:, -1]
-            probs = F.softmax(logits)
-            m = Categorical(probs)
-            next_word = m.sample()
-            log_probs = m.log_prob(next_word)
-            log_probs_saved.append(log_probs)
+        logits = logits[:, -1]
+        probs = F.softmax(logits)
+        m = Categorical(probs)
+        next_word = m.sample()
+        log_probs = m.log_prob(next_word)
+        log_probs_saved.append(log_probs)
 
-            next_word = next_word.data
-            ys = torch.cat([ys, next_word.unsqueeze(-1)], dim=1)
+        next_word = next_word.data
+        ys = torch.cat([ys, next_word.unsqueeze(-1)], dim=1)
 
         # check if previous symbol was <eos>
         is_eos = torch.eq(next_word, eos_index)
