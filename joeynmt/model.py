@@ -17,7 +17,8 @@ from joeynmt.constants import PAD_TOKEN, EOS_TOKEN, BOS_TOKEN
 from joeynmt.search import beam_search, greedy, sample_rl_transformer
 from joeynmt.vocabulary import Vocabulary
 from joeynmt.batch import Batch
-from joeynmt.helpers import ConfigurationError, bpe_postprocess
+from joeynmt.helpers import ConfigurationError, bpe_postprocess, pad_rl_seq
+
 
 from joeynmt.metrics import sent_bleu
 
@@ -46,7 +47,10 @@ class Model(nn.Module):
         :param trg_vocab: target vocabulary
         """
         super(Model, self).__init__()
-        self.baseline = 18.2
+        self.baseline_dict = {}
+        self.init_baseline = 15.0
+        self.delta = 0.20
+
         self.src_embed = src_embed
         self.trg_embed = trg_embed
         self.encoder = encoder
@@ -173,7 +177,7 @@ class Model(nn.Module):
 
         return stacked_output, transposed_log_probs
 
-    def get_rl_loss_for_batch(self, batch: Batch, loss_function, use_cuda: bool, max_output_length: int,
+    def get_rl_loss_for_batch(self, batch: Batch, sentence_samples: int, loss_function, use_cuda: bool, max_output_length: int,
                          level: str) -> Tensor:
         """
         Generate translations for the given data.
@@ -211,66 +215,84 @@ class Model(nn.Module):
         # sort batch now by src length and keep track of order
         sort_reverse_index = batch.sort_by_src_lengths()
 
-        # run as during inference to produce translations & RL score
-        output, transposed_log_probs = self.run_rl_batch(
-            batch=batch, max_output_length=max_output_length)
 
-        # sort outputs back to original order
-        output = output[sort_reverse_index]
-        log_probs = torch.stack(transposed_log_probs).T[sort_reverse_index]# T x B -> B x T as Tensor
 
-        # decode back to symbols
+        sentence_log_probs = []
+        sentence_bleus = []
+
+        for _ in range(sentence_samples): 
+            # run as during inference to produce translations & RL score
+            output, transposed_log_probs = self.run_rl_batch(
+                batch=batch, max_output_length=max_output_length)
+
+            # sort outputs back to original order
+            output = output[sort_reverse_index]
+            log_probs = torch.stack(transposed_log_probs).T[sort_reverse_index]# T x B -> B x T as Tensor
+
+            # decode back to symbols
+            
+            
+            decoded_src = self.src_vocab.arrays_to_sentences(arrays=batch.src, 
+                                                                cut_at_eos=True)
+            decoded_trg = self.trg_vocab.arrays_to_sentences(arrays=batch.trg, 
+                                                                cut_at_eos=True)
+            decoded_valid = self.trg_vocab.arrays_to_sentences(arrays=output,
+                                                                cut_at_eos=True)
+
+
+            # evaluate with metric on full dataset
+            join_char = " " if level in ["word", "bpe"] else ""
+            valid_sources = [join_char.join(s) for s in decoded_src]
+            valid_references = [join_char.join(t) for t in decoded_trg]
+            valid_hypotheses = [join_char.join(t) for t in decoded_valid]
+
+            # post-process
+            if level == "bpe":
+                valid_sources = [bpe_postprocess(s) for s in valid_sources]
+                valid_references = [bpe_postprocess(v)
+                                    for v in valid_references]
+                valid_hypotheses = [bpe_postprocess(v) for
+                                    v in valid_hypotheses]
+            
+            
+            bleu_scores = sent_bleu(valid_hypotheses, valid_references) # len B List[float]
+
+            sentence_log_probs.append(log_probs) # add 3rd dim B x T x 1 for pad seq
+            sentence_bleus.append(bleu_scores)
+
         
+        baselines = [self.baseline_dict.get(ref, self.init_baseline) for ref in valid_references]
+        #breakpoint()
+        average_bleus = []
+        for i in range(len(bleu_scores)): # iterate through batch_size
+            example_bleus = []
+            for sample in sentence_bleus: # then iterate through each sample taken 
+                example_bleus.append(sample[i])
+            average_bleus.append(np.mean(example_bleus))
+        mean_score = np.mean(average_bleus)
         
-        decoded_src = self.src_vocab.arrays_to_sentences(arrays=batch.src, 
-                                                            cut_at_eos=True)
-        decoded_trg = self.trg_vocab.arrays_to_sentences(arrays=batch.trg, 
-                                                            cut_at_eos=True)
-        decoded_valid = self.trg_vocab.arrays_to_sentences(arrays=output,
-                                                            cut_at_eos=True)
+        #average_bleus = [np.mean(bleu_score[i] for i in range(sentence_samples) for bleu_scores in bleu_scores]) 
 
-
-        # evaluate with metric on full dataset
-        join_char = " " if level in ["word", "bpe"] else ""
-        valid_sources = [join_char.join(s) for s in decoded_src]
-        valid_references = [join_char.join(t) for t in decoded_trg]
-        valid_hypotheses = [join_char.join(t) for t in decoded_valid]
-
-        # post-process
-        if level == "bpe":
-            valid_sources = [bpe_postprocess(s) for s in valid_sources]
-            valid_references = [bpe_postprocess(v)
-                                for v in valid_references]
-            valid_hypotheses = [bpe_postprocess(v) for
-                                v in valid_hypotheses]
-
-        # if references are given, evaluate against them
-
-        assert len(valid_hypotheses) == len(valid_references)
-        #if self.counter == 20: 
-
-        #for h, r in zip(valid_hypotheses, valid_references): 
-        #    print(f"hypothesis is: {h}")
-        #    print("-"*40)
-        #    print(f"reference is {r}")
-        #    self.counter = 0
-        #else: 
-            #self.counter += 1
-        reinforce_scores = sent_bleu(valid_hypotheses, valid_references) # len B List[float]
-        reinforce_scores = torch.tensor(reinforce_scores).unsqueeze(-1) 
-        mean_score = reinforce_scores.mean().item()
-        adjusted_scores = -1*(reinforce_scores - self.baseline)
+        #average_bleus = [np.mean([bleu_score[i] for bleu_score in sentence_bleus] \
+        #                    for i in range(sentence_samples)] # outer loop through the number of total samples taken
+        adjusted_baselines = [self.delta*baseline + (1-self.delta)*avg_bleu for baseline, avg_bleu in zip(baselines, average_bleus)]
+        
+        # update the baseline dictionary
+        for ref, adjusted_baseline in zip(valid_references, adjusted_baselines): 
+            self.baseline_dict[ref] = adjusted_baseline
+        reinforce_scores = -1 * torch.tensor(sentence_bleus) - torch.tensor(adjusted_baselines).unsqueeze(0)
+        # stack along dim = 0, sample X example x sequence_length
+        #breakpoint()
+        sentence_log_probs = pad_rl_seq(sentence_log_probs)
+        #sentence_log_probs = torch.tensor(sentence_log_probs)
+        #sentence_log_probs = torch.nn.utils.rnn.pad_sequence(sentence_log_probs, batch_first=True)
+        #sentence_log_probs = torch.stack(sentence_log_probs, dim=0)
         if use_cuda:
-            adjusted_scores = adjusted_scores.cuda()
-            log_probs = log_probs.cuda()
-        reward_adjusted_log_probs = torch.mul(log_probs, adjusted_scores)
-        
-        self.baseline*=0.7
-        self.baseline+=0.3*mean_score
-
+            reinforce_scores = reinforce_scores.cuda()
+            sentence_log_probs = sentence_log_probs.cuda()
+        reward_adjusted_log_probs = torch.mul(sentence_log_probs, reinforce_scores.unsqueeze(2)) # add an extra dimension for time-steps
+            
         batch_rl_loss = reward_adjusted_log_probs.sum()
-        #print(f"batch loss is {batch_rl_loss}")
-
         mle_loss = self.get_loss_for_batch(batch, loss_function)
         loss = 0.3*mle_loss + 0.7*batch_rl_loss
         

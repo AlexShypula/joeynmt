@@ -127,7 +127,8 @@ class TrainManager:
                                      "Valid options: 'word', 'bpe', 'char'.")
         self.shuffle = train_config.get("shuffle", True)
         self.epochs = train_config["epochs"]
-        self.batch_size = train_config["batch_size"]
+        self.sentence_samples = train_config.get("sentence_samples", 1)
+        self.batch_size = train_config["batch_size"] // self.sentence_samples
         self.batch_type = train_config.get("batch_type", "sentence")
         self.eval_batch_size = train_config.get("eval_batch_size",
                                                 self.batch_size)
@@ -340,8 +341,8 @@ class TrainManager:
                                               multi_batch_loss, self.steps)
                     self.tb_writer.add_scalar("train/train_batch_avg_bleu", 
                             multi_batch_bleu, self.steps)
-                    self.tb_writer.add_scalar("train/baseline", 
-                                                self.model.baseline, self.steps)
+                    #self.tb_writer.add_scalar("train/baseline", 
+                    #                            self.model.baseline, self.steps)
                     epoch_loss+=multi_batch_loss
                     del multi_batch_loss
                     del multi_batch_bleu
@@ -494,9 +495,10 @@ class TrainManager:
         """
         #breakpoint()
         if mode == "RL":
-            batch_loss, batch_bleu = self.model.get_rl_loss_for_batch(batch = batch, loss_function = self.loss, use_cuda=self.use_cuda, 
-                                                          max_output_length =  self.max_output_length, 
-                                                          level = self.level)
+            batch_loss, batch_bleu = self.model.get_rl_loss_for_batch(batch = batch, sentence_samples = self.sentence_samples, 
+                    loss_function = self.loss, use_cuda=self.use_cuda, 
+                    max_output_length =  self.max_output_length, 
+                    level = self.level)
         else:     
             batch_loss = self.model.get_loss_for_batch(
                 batch=batch, loss_function=self.loss)

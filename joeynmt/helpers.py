@@ -24,6 +24,29 @@ from joeynmt.vocabulary import Vocabulary
 from joeynmt.plotting import plot_heatmap
 
 
+
+def pad_rl_seq(samples, padding_value = 0): 
+    # each sample input is n_seqs x seq_len 
+    batch_first = True
+    n_seqs = samples[0].size(0)
+    max_len = max([s.size(1) for s in samples])
+    if batch_first:
+        out_dims = (len(samples), n_seqs, max_len)
+    #else:
+    #    out_dims = (max_len, len(sequences)) + trailing_dims
+    out_tensor = samples[0].data.new(*out_dims).fill_(padding_value)
+    for i, tensor in enumerate(samples):
+        length = tensor.size(1)
+        # use index notation to prevent duplicate references to the tensor
+        if batch_first:
+            out_tensor[i, ..., :length] = tensor
+        #else:
+        #    out_tensor[:length, i, ...] = tensor
+
+    return out_tensor
+
+
+
 class ConfigurationError(Exception):
     """ Custom exception for misspecifications of configuration """
 
