@@ -14,7 +14,7 @@ from joeynmt.embeddings import Embeddings
 from joeynmt.encoders import Encoder, RecurrentEncoder, TransformerEncoder
 from joeynmt.decoders import Decoder, RecurrentDecoder, TransformerDecoder
 from joeynmt.constants import PAD_TOKEN, EOS_TOKEN, BOS_TOKEN
-from joeynmt.search import beam_search, greedy, sample_rl_transformer
+from joeynmt.search import beam_search, greedy, sample_rl
 from joeynmt.vocabulary import Vocabulary
 from joeynmt.batch import Batch
 from joeynmt.helpers import ConfigurationError, bpe_postprocess, pad_rl_seq
@@ -146,6 +146,7 @@ class Model(nn.Module):
         batch_loss = loss_function(log_probs, batch.trg)
         # return batch loss = sum over all elements in batch that are not pad
         return batch_loss
+
     
     def run_rl_batch(self, batch: Batch, max_output_length: int) -> (np.array, np.array):
         """
@@ -167,7 +168,7 @@ class Model(nn.Module):
             max_output_length = int(max(batch.src_lengths.cpu().numpy()) * 1.5)
 
         # greedy decoding
-        stacked_output, transposed_log_probs = sample_rl_transformer(
+        stacked_output, transposed_log_probs, stacked_attention_scores, entropy = sample_rl(
                 encoder_hidden=encoder_hidden,
                 encoder_output=encoder_output, eos_index=self.eos_index,
                 src_mask=batch.src_mask, embed=self.trg_embed,
@@ -175,7 +176,7 @@ class Model(nn.Module):
                 max_output_length=max_output_length)
             # batch, time, max_src_length
 
-        return stacked_output, transposed_log_probs
+        return stacked_output, transposed_log_probs, stacked_attention_scores, entropy
 
     def get_rl_loss_for_batch(self, batch: Batch, sentence_samples: int, loss_function, use_cuda: bool, max_output_length: int,
                          level: str) -> Tensor:
@@ -222,7 +223,7 @@ class Model(nn.Module):
 
         for _ in range(sentence_samples): 
             # run as during inference to produce translations & RL score
-            output, transposed_log_probs = self.run_rl_batch(
+            stacked_output, transposed_log_probs, stacked_attention_scores, entropy = self.run_rl_batch(
                 batch=batch, max_output_length=max_output_length)
 
             # sort outputs back to original order

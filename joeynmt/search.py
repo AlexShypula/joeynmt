@@ -10,8 +10,254 @@ from joeynmt.helpers import tile
 from torch.distributions.categorical import Categorical
 
 
-__all__ = ["greedy", "transformer_greedy", "beam_search"]
+__all__ = ["greedy", "transformer_greedy", "beam_search", "sample_rl",  "sample_rl_transformer", "sample_rl_recurrent"]
 
+
+def sample_rl(src_mask: Tensor, embed: Embeddings, bos_index: int, eos_index: int,
+           max_output_length: int, decoder: Decoder,
+           encoder_output: Tensor, encoder_hidden: Tensor): # has 3 return values
+    """
+    Greedy decoding. Select the token word highest probability at each time
+    step. This function is a wrapper that calls recurrent_greedy for
+    recurrent decoders and transformer_greedy for transformer decoders.
+
+    :param src_mask: mask for source inputs, 0 for positions after </s>
+    :param embed: target embedding
+    :param bos_index: index of <s> in the vocabulary
+    :param eos_index: index of </s> in the vocabulary
+    :param max_output_length: maximum length for the hypotheses
+    :param decoder: decoder to use for greedy decoding
+    :param encoder_output: encoder hidden states for attention
+    :param encoder_hidden: encoder last state for decoder initialization
+    :return:
+    """
+
+    if isinstance(decoder, TransformerDecoder):
+        # Transformer greedy decoding
+        greedy_fun = sample_rl_transformer
+    else:
+        # Recurrent greedy decoding
+        greedy_fun = sample_rl_recurrent
+
+    return greedy_fun(
+        src_mask, embed, bos_index, eos_index, max_output_length,
+        decoder, encoder_output, encoder_hidden)
+
+
+
+# pylint: disable=unused-argument
+def sample_rl_recurrent(
+        src_mask: Tensor, embed: Embeddings, bos_index: int, eos_index: int,
+        max_output_length: int, decoder: Decoder,
+        encoder_output: Tensor, encoder_hidden: Tensor):
+    """
+    Special greedy function for transformer, since it works differently.
+    The transformer remembers all previous states and attends to them.
+
+    :param src_mask: mask for source inputs, 0 for positions after </s>
+    :param embed: target embedding layer
+    :param bos_index: index of <s> in the vocabulary
+    :param eos_index: index of </s> in the vocabulary
+    :param max_output_length: maximum length for the hypotheses
+    :param decoder: decoder to use for greedy decoding
+    :param encoder_output: encoder hidden states for attention
+    :param encoder_hidden: encoder final state (unused in Transformer)
+    :return:
+        - stacked_output: output hypotheses (2d array of indices),
+        - stacked_attention_scores: attention scores (3d array)
+    """
+
+    batch_size = src_mask.size(0)
+    prev_y = src_mask.new_full(size=[batch_size, 1], fill_value=bos_index,
+                               dtype=torch.long)
+
+    log_probs_saved = []
+    output = []
+    attention_scores = []
+    hidden = None
+    prev_att_vector = None
+    # finished = src_mask.new_zeros((batch_size, 1)).byte()
+    is_finished = src_mask.new_zeros((batch_size, 1)).bool()
+    entropy = 0
+
+    # pylint: disable=unused-variable
+    for t in range(max_output_length):
+        # decode one single step
+        logits, hidden, att_probs, prev_att_vector = decoder(
+            encoder_output=encoder_output,
+            encoder_hidden=encoder_hidden,
+            src_mask=src_mask,
+            trg_embed=embed(prev_y),
+            hidden=hidden,
+            prev_att_vector=prev_att_vector,
+            unroll_steps=1)
+        # logits: batch x time=1 x vocab (logits)
+        probs = F.softmax(logits.squeeze(1), dim=1)  # now batch x vocab
+        m = Categorical(probs)
+        next_word = m.sample()
+        # 1 where the sequence is not finished, 0 otherwise
+        not_finished_mask = (~is_finished).float().squeeze(1)
+        log_probs = m.log_prob(next_word) * not_finished_mask
+        log_probs_saved.append(log_probs)
+        entropy += (m.entropy()*not_finished_mask).sum()  # will later normalize by the number of tokens
+
+        output.append(next_word.detach().cpu().numpy())
+        prev_y = next_word.unsqueeze(1)
+        attention_scores.append(att_probs.squeeze(1).detach().cpu().numpy())
+        # batch, max_src_lengths
+        # check if previous symbol was <eos>, need to add to mask only after generating <eos>
+        is_eos = torch.eq(next_word.unsqueeze(1), eos_index)
+        is_finished|=is_eos # or the is_eos
+        # stop predicting if <eos> reached for all elements in batch
+        if (is_finished).sum() == batch_size:
+            break
+
+    stacked_output = np.stack(output, axis=1)  # batch, time
+    stacked_attention_scores = np.stack(attention_scores, axis=1)
+
+    return stacked_output, log_probs_saved, stacked_attention_scores, entropy
+
+
+# pylint: disable=unused-argument
+def transformer_greedy(
+        src_mask: Tensor, embed: Embeddings,
+        bos_index: int, eos_index: int,
+        max_output_length: int, decoder: Decoder,
+        encoder_output: Tensor, encoder_hidden: Tensor) -> (np.array, None):
+    """
+    Special greedy function for transformer, since it works differently.
+    The transformer remembers all previous states and attends to them.
+
+    :param src_mask: mask for source inputs, 0 for positions after </s>
+    :param embed: target embedding layer
+    :param bos_index: index of <s> in the vocabulary
+    :param eos_index: index of </s> in the vocabulary
+    :param max_output_length: maximum length for the hypotheses
+    :param decoder: decoder to use for greedy decoding
+    :param encoder_output: encoder hidden states for attention
+    :param encoder_hidden: encoder final state (unused in Transformer)
+    :return:
+        - stacked_output: output hypotheses (2d array of indices),
+        - stacked_attention_scores: attention scores (3d array)
+    """
+
+    batch_size = src_mask.size(0)
+
+    # start with BOS-symbol for each sentence in the batch
+    ys = encoder_output.new_full([batch_size, 1], bos_index, dtype=torch.long)
+
+    # a subsequent mask is intersected with this in decoder forward pass
+    trg_mask = src_mask.new_ones([1, 1, 1])
+
+    finished = src_mask.new_zeros((batch_size)).byte()
+
+    for _ in range(max_output_length):
+
+        trg_embed = embed(ys)  # embed the previous tokens
+
+        # pylint: disable=unused-variable
+        with torch.no_grad():
+            logits, out, _, _ = decoder(
+                trg_embed=trg_embed,
+                encoder_output=encoder_output,
+                encoder_hidden=None,
+                src_mask=src_mask,
+                unroll_steps=None,
+                hidden=None,
+                trg_mask=trg_mask
+            )
+
+            logits = logits[:, -1]
+            _, next_word = torch.max(logits, dim=1)
+            next_word = next_word.data
+            ys = torch.cat([ys, next_word.unsqueeze(-1)], dim=1)
+
+        # check if previous symbol was <eos>
+        is_eos = torch.eq(next_word, eos_index)
+        finished += is_eos
+        # stop predicting if <eos> reached for all elements in batch
+        if (finished >= 1).sum() == batch_size:
+            break
+
+    ys = ys[:, 1:]  # remove BOS-symbol
+    return ys.detach().cpu().numpy(), None
+
+
+# pylint: disable=unused-argument
+def sample_rl_transformer(
+        src_mask: Tensor, embed: Embeddings,
+        bos_index: int, eos_index: int,
+        max_output_length: int, decoder: Decoder,
+        encoder_output: Tensor, encoder_hidden: Tensor):
+    """
+    Special greedy function for transformer, since it works differently.
+    The transformer remembers all previous states and attends to them.
+
+    :param src_mask: mask for source inputs, 0 for positions after </s>
+    :param embed: target embedding layer
+    :param bos_index: index of <s> in the vocabulary
+    :param eos_index: index of </s> in the vocabulary
+    :param max_output_length: maximum length for the hypotheses
+    :param decoder: decoder to use for greedy decoding
+    :param encoder_output: encoder hidden states for attention
+    :param encoder_hidden: encoder final state (unused in Transformer)
+    :return:
+        - stacked_output: output hypotheses (2d array of indices),
+        - stacked_attention_scores: attention scores (3d array)
+    """
+
+    batch_size = src_mask.size(0)
+
+    # start with BOS-symbol for each sentence in the batch
+    ys = encoder_output.new_full([batch_size, 1], bos_index, dtype=torch.long)
+
+    # a subsequent mask is intersected with this in decoder forward pass
+    trg_mask = src_mask.new_ones([1, 1, 1])
+
+    # finished = src_mask.new_zeros((batch_size)).byte()
+    is_finished = src_mask.new_zeros((batch_size, 1)).bool()
+    entropy = 0
+
+    log_probs_saved = []
+
+    for t in range(max_output_length):
+
+        trg_embed = embed(ys)  # embed the previous tokens
+
+        # pylint: disable=unused-variable
+        #with torch.no_grad():
+        logits, out, _, _ = decoder(
+            trg_embed=trg_embed,
+            encoder_output=encoder_output,
+            encoder_hidden=None,
+            src_mask=src_mask,
+            unroll_steps=None,
+            hidden=None,
+            trg_mask=trg_mask)
+
+
+        logits = logits[:, -1]
+        probs = F.softmax(logits, dim=1)
+        m = Categorical(probs)
+        next_word = m.sample()
+        # 1 where the sequence is not finished, 0 otherwise
+        not_finished_mask = (~is_finished).float().squeeze(1)
+        log_probs = m.log_prob(next_word) * not_finished_mask
+        log_probs_saved.append(log_probs)
+        entropy += (m.entropy()*not_finished_mask).sum()  # will later normalize by the number of tokens
+
+        next_word = next_word.data
+        ys = torch.cat([ys, next_word.unsqueeze(-1)], dim=1)
+
+        # check if previous symbol was <eos>, need to add to mask only after generating <eos>
+        is_eos = torch.eq(next_word.unsqueeze(1), eos_index)
+        is_finished|=is_eos # or the is_eos
+        # stop predicting if <eos> reached for all elements in batch
+        if (is_finished).sum() == batch_size:
+            break
+
+    ys = ys[:, 1:]  # remove BOS-symbol
+    return ys.detach().cpu().numpy(), log_probs_saved, None, entropy
 
 def greedy(src_mask: Tensor, embed: Embeddings, bos_index: int, eos_index: int,
            max_output_length: int, decoder: Decoder,
@@ -169,79 +415,6 @@ def transformer_greedy(
 
     ys = ys[:, 1:]  # remove BOS-symbol
     return ys.detach().cpu().numpy(), None
-
-
-# pylint: disable=unused-argument
-def sample_rl_transformer(
-        src_mask: Tensor, embed: Embeddings,
-        bos_index: int, eos_index: int,
-        max_output_length: int, decoder: Decoder,
-        encoder_output: Tensor, encoder_hidden: Tensor) -> (np.array, None):
-    """
-    Special greedy function for transformer, since it works differently.
-    The transformer remembers all previous states and attends to them.
-
-    :param src_mask: mask for source inputs, 0 for positions after </s>
-    :param embed: target embedding layer
-    :param bos_index: index of <s> in the vocabulary
-    :param eos_index: index of </s> in the vocabulary
-    :param max_output_length: maximum length for the hypotheses
-    :param decoder: decoder to use for greedy decoding
-    :param encoder_output: encoder hidden states for attention
-    :param encoder_hidden: encoder final state (unused in Transformer)
-    :return:
-        - stacked_output: output hypotheses (2d array of indices),
-        - stacked_attention_scores: attention scores (3d array)
-    """
-
-    batch_size = src_mask.size(0)
-
-    # start with BOS-symbol for each sentence in the batch
-    ys = encoder_output.new_full([batch_size, 1], bos_index, dtype=torch.long)
-
-    # a subsequent mask is intersected with this in decoder forward pass
-    trg_mask = src_mask.new_ones([1, 1, 1])
-
-    finished = src_mask.new_zeros((batch_size)).byte()
-
-    log_probs_saved = []
-
-    for _ in range(max_output_length):
-
-        trg_embed = embed(ys)  # embed the previous tokens
-
-        # pylint: disable=unused-variable
-        #with torch.no_grad():
-        logits, out, _, _ = decoder(
-            trg_embed=trg_embed,
-            encoder_output=encoder_output,
-            encoder_hidden=None,
-            src_mask=src_mask,
-            unroll_steps=None,
-            hidden=None,
-            trg_mask=trg_mask
-        )
-
-        logits = logits[:, -1]
-        probs = F.softmax(logits)
-        m = Categorical(probs)
-        next_word = m.sample()
-        log_probs = m.log_prob(next_word)
-        log_probs_saved.append(log_probs)
-
-        next_word = next_word.data
-        ys = torch.cat([ys, next_word.unsqueeze(-1)], dim=1)
-
-        # check if previous symbol was <eos>
-        is_eos = torch.eq(next_word, eos_index)
-        finished += is_eos
-        # stop predicting if <eos> reached for all elements in batch
-        if (finished >= 1).sum() == batch_size:
-            break
-
-    ys = ys[:, 1:]  # remove BOS-symbol
-    return ys.detach().cpu().numpy(), log_probs_saved
-
 
 # pylint: disable=too-many-statements,too-many-branches
 def beam_search(
