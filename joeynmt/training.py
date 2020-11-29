@@ -143,7 +143,7 @@ class TrainManager:
         
         # bleurt reinforcement learning
         self.rl_weight = train.config.get("rl_weight", 0.0)
-        self.n_sentence_samples = train.get("sentence_smaples", 1)
+        self.n_sentence_samples = train.get("sentence_samples", 1)
         assert self.n_sentence_samples > 0 and type(self.n_sentence_samples) == int
         if self.n_sentence_samples > 1:
             assert self.rl_weight > 0.0, "if your RL weight is 0, then you'll only do MLE .... " \
