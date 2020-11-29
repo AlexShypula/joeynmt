@@ -5,6 +5,16 @@ This module holds various MT evaluation metrics.
 
 import sacrebleu
 from typing import List
+from bleurt import score
+
+class bleurt_scorer:
+    def __init__(self):
+        self.scorer = score.BleurtScorer()
+    def evaluate(self, references: List, hypotheses: List):
+        assert len(references) == len(hypotheses)
+        scores = self.scorer(references=references, candidates=hypotheses)
+        assert len(scores) == len(references)
+        return scores
 
 
 def chrf(hypotheses, references):
