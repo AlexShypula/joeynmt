@@ -140,6 +140,14 @@ class TrainManager:
 
         # generation
         self.max_output_length = train_config.get("max_output_length", None)
+        
+        # bleurt reinforcement learning
+        self.rl_weight = train.config.get("rl_weight", 0.0)
+        self.n_sentence_samples = train.get("sentence_smaples", 1)
+        assert self.n_sentence_samples > 0 and type(self.n_sentence_samples) == int
+        if self.n_sentence_samples > 1:
+            assert self.rl_weight > 0.0, "if your RL weight is 0, then you'll only do MLE .... " \
+                                         "extra sentence samples will not help"
 
         # CPU / GPU
         self.use_cuda = train_config["use_cuda"]
@@ -302,7 +310,10 @@ class TrainManager:
             count = self.current_batch_multiplier - 1
             epoch_loss = 0
             multi_batch_loss = 0
-            multi_batch_bleu = 0
+            multi_batch_rl_loss = 0
+            multi_batch_mle_loss = 0
+            multi_batch_entropy = 0
+            multi_batch_bleurt = 0
 
             for i, batch in enumerate(iter(train_iter)):
                 # reactivate training
@@ -325,32 +336,36 @@ class TrainManager:
 
                 update = count == 0
                 # print(count, update, self.steps)
-                batch_loss, batch_bleu = self._train_batch(
+                batch_loss, batch_rl_loss, batch_mle_loss, entropy, mean_bleurt = self._train_batch(
                     batch, update=update, count=count)
-               
 
                 multi_batch_loss += batch_loss
-                multi_batch_bleu += batch_bleu
-                #torch.cuda.empty_cache()
+                multi_batch_rl_loss += batch_rl_loss
+                multi_batch_mle_loss += batch_mle_loss
+                multi_batch_entropy += entropy
+                multi_batch_bleurt += mean_bleurt
 
-                del batch_loss
                 # Only save finaly computed batch_loss of full batch
                 if update:
                     #breakpoint()
-                    self.tb_writer.add_scalar("train/train_batch_loss",
+                    self.tb_writer.add_scalar("train/batch_loss",
                                               multi_batch_loss, self.steps)
-                    self.tb_writer.add_scalar("train/train_batch_avg_bleu", 
-                            multi_batch_bleu, self.steps)
-                    #self.tb_writer.add_scalar("train/baseline", 
-                    #                            self.model.baseline, self.steps)
+                    self.tb_writer.add_scalar("train/batch_rl_loss",
+                            multi_batch_rl_loss, self.steps)
+                    self.tb_writer.add_scalar("train/batch_mle_loss",
+                            multi_batch_mle_loss, self.steps)
+                    self.tb_writer.add_scalar("train/rl_decoding_entropy",
+                            entropy, self.steps)
+                    self.tb_writer.add_scalar("train/mean_bleurt",
+                            mean_bleurt, self.steps)
+
                     epoch_loss+=multi_batch_loss
-                    del multi_batch_loss
-                    del multi_batch_bleu
-                    gc.collect()
 
                     multi_batch_loss = 0
-                    multi_batch_bleu = 0
-                                                
+                    multi_batch_rl_loss = 0
+                    multi_batch_mle_loss = 0
+                    multi_batch_entropy = 0
+                    multi_batch_bleurt = 0
 
                 count = self.batch_multiplier if update else count
                 count -= 1
@@ -396,6 +411,13 @@ class TrainManager:
                             beam_size=1,  # greedy validations
                             batch_type=self.eval_batch_type
                         )
+
+                    # calculate validation bleurt
+                    valid_bleurt = self.model.bleurt_scorer(references=valid_references,
+                                                            hypotheses=valid_hypotheses)
+
+                    self.tb_writer.add_scalar("valid/valid_bleurt",
+                                              np.mean(valid_bleurt), self.steps)
 
                     self.tb_writer.add_scalar("valid/valid_loss",
                                               valid_loss, self.steps)
@@ -493,49 +515,49 @@ class TrainManager:
         :param count: number of portions (batch_size) left before update
         :return: loss for batch (sum)
         """
-        #breakpoint()
-        if mode == "RL":
-            batch_loss, batch_bleu = self.model.get_rl_loss_for_batch(batch = batch, sentence_samples = self.sentence_samples, 
-                    loss_function = self.loss, use_cuda=self.use_cuda, 
-                    max_output_length =  self.max_output_length, 
+
+
+        # repeat the same batch for the number of samples for each batch
+        # TODO: remove redundant MLE computations for the same batch if self.sentence_samples > 1
+        for _ in self.sentence_samples:
+            # gets the loss, batch_rl loss, and entropy
+            # if rl_weight is 0.0, it will only do supervised learning and the last 3 will be 0
+            # only batch_loss carries the gradients
+            batch_loss, batch_rl_loss, mle_loss, entropy, mean_bleurt = self.model.get_rl_loss_for_batch(batch = batch,
+                    sentence_samples = self.sentence_samples,
+                    loss_function = self.loss, use_cuda=self.use_cuda,
+                    max_output_length =  self.max_output_length,
                     level = self.level)
-        else:     
-            batch_loss = self.model.get_loss_for_batch(
-                batch=batch, loss_function=self.loss)
 
-        # normalize batch loss
-        if self.normalization == "batch":
-            normalizer = batch.nseqs
-        elif self.normalization == "tokens":
-            normalizer = batch.ntokens
-        elif self.normalization == "none":
-            normalizer = 1
-        else:
-            raise NotImplementedError(
-                "Only normalize by 'batch' or 'tokens' "
-                "or summation of loss 'none' implemented")
+            # normalize batch loss
+            if self.normalization == "batch":
+                normalizer = batch.nseqs
+            elif self.normalization == "tokens":
+                normalizer = batch.ntokens
+            elif self.normalization == "none":
+                normalizer = 1
+            else:
+                raise NotImplementedError(
+                    "Only normalize by 'batch' or 'tokens' "
+                    "or summation of loss 'none' implemented")
 
-        norm_batch_loss = batch_loss / normalizer
-        if self.current_batch_multiplier > 1: 
-            norm_batch_loss = norm_batch_loss/self.current_batch_multiplier \
-                    if self.normalization != "none" else norm_batch_loss
-            norm_batch_bleu = batch_bleu / self.current_batch_multiplier \
-                    if self.normalization != "none" else batch_bleu
+            norm_batch_loss = batch_loss / normalizer
+            # normalize by the batch_multiplier
+            if self.current_batch_multiplier > 1:
+                norm_batch_loss = norm_batch_loss/self.current_batch_multiplier \
+                        if self.normalization != "none" else norm_batch_loss
+                batch_rl_loss = norm_batch_loss/self.current_batch_multiplier \
+                        if self.normalization != "none" else batch_rl_loss
+                mle_loss = norm_batch_loss/self.current_batch_multiplier \
+                        if self.normalization != "none" else mle_loss
+                entropy = norm_batch_loss/self.current_batch_multiplier \
+                        if self.normalization != "none" else entropy
+                mean_bleurt = norm_batch_loss/self.current_batch_multiplier \
+                        if self.normalization != "none" else mean_bleurt
 
-
-        norm_batch_loss.backward()
-        #torch.cuda.empty_cache()
+            norm_batch_loss.backward()
 
         if update:
-            #if self.current_batch_multiplier > 1:
-            #    norm_batch_loss = self.norm_batch_loss_accumulated + \
-            #        norm_batch_loss
-            #    norm_batch_loss = norm_batch_loss / \
-            #        self.current_batch_multiplier if \
-            #        self.normalization != "none" else \
-            #        norm_batch_loss
-
-            #norm_batch_loss.backward()
 
             if self.clip_grad_fun is not None:
                 # clip gradients (in-place)
@@ -548,16 +570,9 @@ class TrainManager:
             # increment step counter
             self.steps += 1
 
-        #else:
-        #    if count == self.current_batch_multiplier - 1:
-        #        self.norm_batch_loss_accumulated = norm_batch_loss
-        #    else:
-        #        # accumulate loss of current batch_size * batch_multiplier loss
-        #        self.norm_batch_loss_accumulated += norm_batch_loss
-        # increment token counter
         self.total_tokens += batch.ntokens
 
-        return norm_batch_loss.detach(), norm_batch_bleu
+        return norm_batch_loss.cpu().detach().item(), batch_rl_loss, mle_loss, entropy, mean_bleurt
 
     def _add_report(self, valid_score: float, valid_ppl: float,
                     valid_loss: float, eval_metric: str,

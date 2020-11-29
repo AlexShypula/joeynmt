@@ -222,9 +222,14 @@ class Model(nn.Module):
 
         if rl_weight != 1:
             # note not yet normalized by tokens
+            #TODO: Check here to make sure that we do not delete mle_loss here
+            breakpoint()
             loss = self.get_loss_for_batch(batch, loss_function)
+            # for logging
+            mle_loss = loss.cpu().detach().item()
         else:
             loss = 0
+            mle_loss = 0
 
         if rl_weight > 0.0:
             # run as during inference to produce translations & RL score
@@ -275,11 +280,16 @@ class Model(nn.Module):
             # note this is not normalized by the number of tokens yet
             batch_rl_loss = reward_adjusted_log_probs.sum() - beta_entropy * entropy
             loss = loss * (1-rl_weight) + rl_weight * batch_rl_loss
+
+            batch_rl_loss = batch_rl_loss.cpu().detach().item()
+            entropy = entropy.cpu().detach().item()
+            mean_bleurt = torch.mean(reinforce_scores).item()
         else:
             batch_rl_loss = 0
             entropy = 0
+            mean_bleurt = 0
 
-        return loss, batch_rl_loss, entropy
+        return loss, batch_rl_loss, mle_loss, entropy, mean_bleurt
 
     def __repr__(self) -> str:
         """
